@@ -6,8 +6,19 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const axios = require('axios');
 
+const cloudinary = require('cloudinary').v2;
+
+
 const app = express();
 app.use(helmet());
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+
 
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -173,5 +184,6 @@ app.get('/', (req, res) => res.send('<h1>CexPi Backend - Running</h1>'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
