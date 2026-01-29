@@ -186,18 +186,31 @@ app.post('/api/delete-listing', async (req, res) => {
     const listing = await Listing.findOne({ _id: listingId, sellerUid: piUid });
     if (!listing) return res.status(404).json({ error: 'Listing not found or not owned by you' });
 
+    // حذف الصور من Cloudinary
+    if (listing.images && listing.images.length > 0) {
+      for (let imgUrl of listing.images) {
+        // استخراج public_id من رابط الصورة
+        const parts = imgUrl.split('/');
+        const fileName = parts[parts.length - 1].split('.')[0]; // اسم الملف بدون امتداد
+        await cloudinary.uploader.destroy(`cexpi_listings/${fileName}`);
+      }
+    }
+
+    // حذف الإعلان من MongoDB
     await Listing.deleteOne({ _id: listingId });
-    res.json({ success: true });
+    res.json({ success: true, message: 'Listing and images deleted successfully!' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
+
 app.get('/', (req, res) => res.send('<h1>CexPi Backend - Running</h1>'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
