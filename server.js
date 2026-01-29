@@ -128,21 +128,35 @@ app.post('/api/complete-listing', async (req, res) => {
   }
 
   try {
-    const newListing = new Listing({
-      sellerUid: piUid,
-      title,
-      description,
-      priceInPi,
-      category,
-      make: make || '',
-      model: model || '',
-      year: year || null,
-      mileage: mileage || null,
-      country,
-      region,
-      images: images || [],
-      phoneNumber
+    // رفع الصور إلى Cloudinary
+let uploadedImages = [];
+
+if (images && images.length > 0) {
+  for (let img of images) {
+    const uploadRes = await cloudinary.uploader.upload(img, {
+      folder: 'cexpi_listings',
+      resource_type: 'image'
     });
+    uploadedImages.push(uploadRes.secure_url);
+  }
+}
+
+const newListing = new Listing({
+  sellerUid: piUid,
+  title,
+  description,
+  priceInPi,
+  category,
+  make: make || '',
+  model: model || '',
+  year: year || null,
+  mileage: mileage || null,
+  country,
+  region,
+  images: uploadedImages,
+  phoneNumber
+});
+
 
     await newListing.save();
     res.json({ success: true, message: 'Listing published successfully!' });
@@ -184,6 +198,7 @@ app.get('/', (req, res) => res.send('<h1>CexPi Backend - Running</h1>'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
