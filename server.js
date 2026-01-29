@@ -47,7 +47,7 @@ const ListingSchema = new mongoose.Schema({
   description: { type: String, required: true },
   priceInPi: { type: Number, required: true },
   category: { type: String, required: true },
-  make: String,
+  mark: String,
   model: String,
   year: Number,
   mileage: Number,
@@ -121,7 +121,7 @@ app.post('/api/complete-payment', async (req, res) => {
 
 // نشر الإعلان
 app.post('/api/complete-listing', async (req, res) => {
-  const { piUid, title, description, priceInPi, category, make, model, year, mileage, country, region, images, phoneNumber } = req.body;
+  const { piUid, title, description, priceInPi, category, mark, model, year, mileage, country, region, images, phoneNumber } = req.body;
 
   if (!piUid || !title || !description || !priceInPi || !category || !country || !region || !phoneNumber) {
     return res.status(400).json({ error: 'Missing required fields' });
@@ -147,7 +147,7 @@ const newListing = new Listing({
   description,
   priceInPi,
   category,
-  make: make || '',
+  mark: mark || '',
   model: model || '',
   year: year || null,
   mileage: mileage || null,
@@ -210,6 +210,7 @@ app.get('/', (req, res) => res.send('<h1>CexPi Backend - Running</h1>'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
