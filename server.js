@@ -13,6 +13,13 @@ app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100
 }));
+
+// Stricter limiter for sensitive/state-changing endpoints
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30
+});
+
 const allowedOrigins = [
   "https://cexpi2026-svg.github.io"
 ];
@@ -29,6 +36,7 @@ app.use(cors({
     return callback(new Error("CORS blocked"));
   },
   methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: false
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -37,12 +45,68 @@ mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ Connected to MongoDB successfully'))
   .catch(err => console.error('❌ MongoDB connection error:', err));
 
+// ================= SECURITY HELPERS =================
+
+// يتحقق من صحة accessToken المرسل من Pi Network ويعيد بيانات المستخدم الحقيقية (uid, username)
+async function verifyPiToken(accessToken) {
+  if (!accessToken || typeof accessToken !== 'string') {
+    throw new Error('Missing access token');
+  }
+  const verifyRes = await axios.get('https://api.minepi.com/v2/me', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  return verifyRes.data; // { uid, username, ... }
+}
+
+// Middleware: يفرض وجود Authorization: Bearer <token> صالح، ويضع المستخدم الحقيقي في req.piUser
+// هذا يمنع أي شخص من انتحال piUid آخر عبر تعديل body الطلب فقط
+async function requirePiAuth(req, res, next) {
+  try {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
+    const accessToken = authHeader.slice(7).trim();
+    const piUser = await verifyPiToken(accessToken);
+    if (!piUser || !piUser.uid) {
+      return res.status(401).json({ error: 'Invalid access token' });
+    }
+    req.piUser = piUser;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Authentication failed. Please login again.' });
+  }
+}
+
+function isNonEmptyString(v, maxLen) {
+  return typeof v === 'string' && v.trim().length > 0 && v.trim().length <= maxLen;
+}
+
+function isValidObjectId(id) {
+  return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
+}
+
+// يتحقق أن الصورة هي data URL صالحة لنوع صورة مسموح، وبحجم معقول (لتفادي XSS وتضخم القاعدة)
+const MAX_IMAGE_BASE64_LENGTH = 1400000; // ~1MB لكل صورة تقريباً
+const IMAGE_DATA_URL_REGEX = /^data:image\/(jpeg|jpg|png|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function isValidImageDataUrl(str) {
+  if (typeof str !== 'string') return false;
+  if (str.length === 0 || str.length > MAX_IMAGE_BASE64_LENGTH) return false;
+  return IMAGE_DATA_URL_REGEX.test(str);
+}
+
+const ALLOWED_CATEGORIES = ['car', 'truck', 'motorcycle'];
+
+// ================= SCHEMAS =================
+
 // نموذج المستخدم
 const UserSchema = new mongoose.Schema({
   piUid: { type: String, required: true, unique: true },
   piUsername: { type: String, required: true },
   country: { type: String, required: true },
-  welcomeRewardSent: { type: Boolean, default: false }, // ✅ هذا السطر الجديد
+  welcomeRewardSent: { type: Boolean, default: false },
+  listingCredits: { type: Number, default: 0, min: 0 }, // عدد الإعلانات المدفوعة وغير المستخدمة بعد
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -51,140 +115,255 @@ const User = mongoose.model('User', UserSchema);
 // نموذج الإعلان
 const ListingSchema = new mongoose.Schema({
   sellerUid: { type: String, required: true },
-  title: { type: String, required: true },
-  description: { type: String, required: true },
-  priceInPi: { type: Number, required: true },
-  category: { type: String, required: true },
-  make: String,
-  model: String,
-  year: Number,
-  mileage: Number,
-  country: { type: String, required: true },
-  region: { type: String, required: true },
-  images: [String],
-  phoneNumber: { type: String, required: true },
+  title: { type: String, required: true, trim: true, maxlength: 150 },
+  description: { type: String, required: true, trim: true, maxlength: 3000 },
+  priceInPi: { type: Number, required: true, min: 0, max: 100000000 },
+  category: { type: String, required: true, enum: ALLOWED_CATEGORIES },
+  make: { type: String, trim: true, maxlength: 60, default: '' },
+  model: { type: String, trim: true, maxlength: 60, default: '' },
+  year: { type: Number, min: 1900, max: 2100, default: null },
+  mileage: { type: Number, min: 0, max: 10000000, default: null },
+  country: { type: String, required: true, trim: true, maxlength: 100 },
+  region: { type: String, required: true, trim: true, maxlength: 150 },
+  images: [{ type: String, maxlength: MAX_IMAGE_BASE64_LENGTH }],
+  phoneNumber: { type: String, required: true, trim: true, maxlength: 30 },
   createdAt: { type: Date, default: Date.now },
   active: { type: Boolean, default: true }
 });
 const Listing = mongoose.model('Listing', ListingSchema);
 
+// نموذج تتبع المدفوعات (لمنع نشر إعلانات بدون دفع فعلي)
+const PaymentRecordSchema = new mongoose.Schema({
+  paymentId: { type: String, required: true, unique: true },
+  piUid: { type: String, required: true },
+  type: { type: String, required: true }, // 'listing_fee'
+  status: { type: String, required: true, default: 'approved' }, // approved | completed | cancelled
+  txid: { type: String, default: null },
+  createdAt: { type: Date, default: Date.now }
+});
+const PaymentRecord = mongoose.model('PaymentRecord', PaymentRecordSchema);
+
+// ================= ROUTES =================
+
 // تسجيل المستخدم
 app.post('/api/register-user', async (req, res) => {
   const { piUid, piUsername, country } = req.body;
-  if (!piUid || !piUsername || !country) return res.status(400).json({ error: 'Missing fields' });
+  if (!isNonEmptyString(piUid, 100) || !isNonEmptyString(piUsername, 100) || !isNonEmptyString(country, 100)) {
+    return res.status(400).json({ error: 'Missing or invalid fields' });
+  }
 
   try {
-    await User.findOneAndUpdate({ piUid }, { piUsername, country }, { upsert: true, new: true });
+    await User.findOneAndUpdate(
+      { piUid },
+      { piUsername, country },
+      { upsert: true, new: true }
+    );
     res.json({ success: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// إنشاء طلب دفع
-app.post('/api/create-listing-payment', async (req, res) => {
-  const { piUid } = req.body;
-  if (!piUid) return res.status(400).json({ error: 'piUid required' });
-
+// إنشاء طلب دفع (لا حاجة لمصادقة صارمة هنا، فقط يرجع معلومات الدفع)
+app.post('/api/create-listing-payment', requirePiAuth, async (req, res) => {
   res.json({
     success: true,
     amount: 0.5,
     memo: 'CexPi Listing Fee - 0.5 Pi',
-    metadata: { type: 'listing_fee', piUid }
+    metadata: { type: 'listing_fee', piUid: req.piUser.uid }
   });
 });
 
-// موافقة على الدفع
-app.post('/api/approve-payment', async (req, res) => {
+// موافقة على الدفع — هنا نتحقق من هوية المستخدم ومن صحة الدفعة قبل الموافقة عليها
+app.post('/api/approve-payment', strictLimiter, requirePiAuth, async (req, res) => {
   const { paymentId } = req.body;
-  if (!paymentId) return res.status(400).json({ error: 'paymentId required' });
+  if (!isNonEmptyString(paymentId, 200)) {
+    return res.status(400).json({ error: 'paymentId required' });
+  }
 
   try {
+    // جلب تفاصيل الدفعة من Pi Network للتأكد أنها حقيقية وتخص هذا المستخدم
+    const paymentInfo = await axios.get(`https://api.minepi.com/v2/payments/${paymentId}`, {
+      headers: { Authorization: `Key ${process.env.PI_API_KEY}` }
+    });
+    const payment = paymentInfo.data;
+
+    if (!payment || payment.user_uid !== req.piUser.uid) {
+      return res.status(403).json({ error: 'Payment does not belong to this user' });
+    }
+
+    const metaType = payment.metadata && payment.metadata.type;
+    if (metaType !== 'listing_fee' || Math.abs(payment.amount - 0.5) > 0.0001) {
+      return res.status(400).json({ error: 'Unexpected payment data' });
+    }
+
     await axios.post(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {}, {
       headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
     });
+
+    // نسجل الدفعة كمعتمدة، حتى نمنح رصيد نشر إعلان بعد اكتمالها فقط
+    await PaymentRecord.findOneAndUpdate(
+      { paymentId },
+      { paymentId, piUid: req.piUser.uid, type: 'listing_fee', status: 'approved' },
+      { upsert: true, new: true }
+    );
+
     res.json({ success: true });
   } catch (e) {
     console.error('Approve error:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    res.status(500).json({ error: 'Failed to approve payment' });
   }
 });
 
-// إكمال الدفع
-app.post('/api/complete-payment', async (req, res) => {
+// إكمال الدفع — لا يفرض رمز مصادقة جديد (لأن السحب التلقائي onIncompletePaymentFound
+// قد يحدث قبل توفر التوكن)، لكن منح "رصيد نشر إعلان" يتم فقط إذا وُجد سجل دفعة معتمدة سابقاً
+// تم التحقق منها بالكامل في approve-payment أعلاه — لذلك لا يمكن لأحد تزوير رصيد إعلان.
+app.post('/api/complete-payment', strictLimiter, async (req, res) => {
   const { paymentId, txid } = req.body;
-  if (!paymentId || !txid) return res.status(400).json({ error: 'paymentId and txid required' });
+  if (!isNonEmptyString(paymentId, 200) || !isNonEmptyString(txid, 200)) {
+    return res.status(400).json({ error: 'paymentId and txid required' });
+  }
 
   try {
     await axios.post(`https://api.minepi.com/v2/payments/${paymentId}/complete`, { txid }, {
       headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
     });
+
+    const record = await PaymentRecord.findOne({ paymentId });
+    if (record && record.status === 'approved' && record.type === 'listing_fee') {
+      record.status = 'completed';
+      record.txid = txid;
+      await record.save();
+
+      await User.findOneAndUpdate(
+        { piUid: record.piUid },
+        { $inc: { listingCredits: 1 } },
+        { upsert: true }
+      );
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error('Complete error:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    res.status(500).json({ error: 'Failed to complete payment' });
   }
 });
 
-// نشر الإعلان
-app.post('/api/complete-listing', async (req, res) => {
-  const { piUid, title, description, priceInPi, category, make, model, year, mileage, country, region, images, phoneNumber } = req.body;
+// نشر الإعلان — يتطلب مصادقة صالحة + رصيد إعلان مدفوع فعلياً (لمنع النشر المجاني)
+app.post('/api/complete-listing', strictLimiter, requirePiAuth, async (req, res) => {
+  const {
+    title, description, priceInPi, category, make, model,
+    year, mileage, country, region, images, phoneNumber
+  } = req.body;
 
-  if (!piUid || !title || !description || !priceInPi || !category || !country || !region || !phoneNumber) {
-    return res.status(400).json({ error: 'Missing required fields' });
+  // تحقق من صحة الحقول
+  if (!isNonEmptyString(title, 150)) return res.status(400).json({ error: 'Invalid title' });
+  if (!isNonEmptyString(description, 3000)) return res.status(400).json({ error: 'Invalid description' });
+  if (typeof priceInPi !== 'number' || isNaN(priceInPi) || priceInPi < 0 || priceInPi > 100000000) {
+    return res.status(400).json({ error: 'Invalid price' });
+  }
+  if (!ALLOWED_CATEGORIES.includes(category)) return res.status(400).json({ error: 'Invalid category' });
+  if (!isNonEmptyString(country, 100)) return res.status(400).json({ error: 'Invalid country' });
+  if (!isNonEmptyString(region, 150)) return res.status(400).json({ error: 'Invalid region' });
+  if (!isNonEmptyString(phoneNumber, 30) || !/^[0-9+\-\s()]{5,30}$/.test(phoneNumber.trim())) {
+    return res.status(400).json({ error: 'Invalid phone number' });
+  }
+  if (make !== undefined && make !== null && (typeof make !== 'string' || make.length > 60)) {
+    return res.status(400).json({ error: 'Invalid make' });
+  }
+  if (model !== undefined && model !== null && (typeof model !== 'string' || model.length > 60)) {
+    return res.status(400).json({ error: 'Invalid model' });
+  }
+  if (year !== undefined && year !== null && (typeof year !== 'number' || year < 1900 || year > 2100)) {
+    return res.status(400).json({ error: 'Invalid year' });
+  }
+  if (mileage !== undefined && mileage !== null && (typeof mileage !== 'number' || mileage < 0 || mileage > 10000000)) {
+    return res.status(400).json({ error: 'Invalid mileage' });
   }
 
+  let safeImages = [];
+  if (images !== undefined && images !== null) {
+    if (!Array.isArray(images) || images.length > 6) {
+      return res.status(400).json({ error: 'Maximum 6 images allowed' });
+    }
+    for (const img of images) {
+      if (!isValidImageDataUrl(img)) {
+        return res.status(400).json({ error: 'One or more images are invalid or too large (max ~1MB each)' });
+      }
+    }
+    safeImages = images;
+  }
+
+  // التحقق من وجود رصيد إعلان مدفوع، وخصمه بشكل ذري لمنع استخدام نفس الدفعة مرتين
   try {
+    const debited = await User.findOneAndUpdate(
+      { piUid: req.piUser.uid, listingCredits: { $gt: 0 } },
+      { $inc: { listingCredits: -1 } },
+      { new: true }
+    );
+
+    if (!debited) {
+      return res.status(402).json({ error: 'No paid listing credit found. Please complete the 0.5 Pi payment first.' });
+    }
+
     const newListing = new Listing({
-      sellerUid: piUid,
-      title,
-      description,
+      sellerUid: req.piUser.uid,
+      title: title.trim(),
+      description: description.trim(),
       priceInPi,
       category,
-      make: make || '',
-      model: model || '',
+      make: (make || '').trim(),
+      model: (model || '').trim(),
       year: year || null,
       mileage: mileage || null,
-      country,
-      region,
-      images: images || [],
-      phoneNumber
+      country: country.trim(),
+      region: region.trim(),
+      images: safeImages,
+      phoneNumber: phoneNumber.trim()
     });
 
     await newListing.save();
     res.json({ success: true, message: 'Listing published successfully!' });
   } catch (e) {
     console.error('Save listing error:', e);
-    res.status(500).json({ error: e.message || 'Failed to save listing' });
+    // في حال فشل الحفظ بعد خصم الرصيد، نعيد الرصيد للمستخدم
+    try {
+      await User.findOneAndUpdate({ piUid: req.piUser.uid }, { $inc: { listingCredits: 1 } });
+    } catch (refundErr) {
+      console.error('Refund credit error:', refundErr);
+    }
+    res.status(500).json({ error: 'Failed to save listing' });
   }
 });
 
-// جلب الإعلانات (معدل ليجلب كل الإعلانات بدون شرط country)
+// جلب الإعلانات (عام، بدون مصادقة)
 app.get('/api/get-listings', async (req, res) => {
   try {
     const listings = await Listing.find({ active: true }).sort({ createdAt: -1 });
     res.json({ success: true, listings });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// حذف الإعلان
-app.post('/api/delete-listing', async (req, res) => {
-  const { listingId, piUid } = req.body;
-  if (!listingId || !piUid) return res.status(400).json({ error: 'listingId and piUid required' });
+// حذف الإعلان — يتطلب مصادقة صالحة، ويستخدم هوية المستخدم الحقيقية من التوكن فقط
+app.post('/api/delete-listing', requirePiAuth, async (req, res) => {
+  const { listingId } = req.body;
+  if (!isValidObjectId(listingId)) {
+    return res.status(400).json({ error: 'Invalid listingId' });
+  }
 
   try {
-    const listing = await Listing.findOne({ _id: listingId, sellerUid: piUid });
+    const listing = await Listing.findOne({ _id: listingId, sellerUid: req.piUser.uid });
     if (!listing) return res.status(404).json({ error: 'Listing not found or not owned by you' });
 
     await Listing.deleteOne({ _id: listingId });
     res.json({ success: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -204,11 +383,9 @@ const PromoClaimSchema = new mongoose.Schema({
 const PromoClaim = mongoose.model('PromoClaim', PromoClaimSchema);
 
 // تحقق من حالة المستخدم: هل يمكنه السحب؟
-app.post('/api/promo-status', async (req, res) => {
-  const { piUid } = req.body;
-  if (!piUid) return res.status(400).json({ error: 'piUid required' });
-
+app.post('/api/promo-status', requirePiAuth, async (req, res) => {
   try {
+    const piUid = req.piUser.uid;
     const alreadyClaimed = await PromoClaim.findOne({ piUid });
     const totalClaims = await PromoClaim.countDocuments();
 
@@ -219,39 +396,29 @@ app.post('/api/promo-status', async (req, res) => {
       isEligible: !alreadyClaimed && totalClaims < 5
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // طلب السحب A2U
-app.post('/api/claim-promo', async (req, res) => {
-  const { piUid, piUsername, accessToken } = req.body;
-  if (!piUid || !piUsername || !accessToken) {
-    return res.status(400).json({ error: 'Missing data' });
-  }
+app.post('/api/claim-promo', strictLimiter, requirePiAuth, async (req, res) => {
+  const piUid = req.piUser.uid;
+  const piUsername = req.piUser.username;
 
   try {
-    // 1. التحقق من صحة المستخدم عبر Pi API
-    const verifyRes = await axios.get('https://api.minepi.com/v2/me', {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-    if (verifyRes.data.uid !== piUid) {
-      return res.status(403).json({ error: 'User mismatch' });
-    }
-
-    // 2. تحقق إن كان قد سحب من قبل
+    // تحقق إن كان قد سحب من قبل
     const alreadyClaimed = await PromoClaim.findOne({ piUid });
     if (alreadyClaimed) {
       return res.status(400).json({ error: 'You have already claimed this reward' });
     }
 
-    // 3. تحقق من عدد السحوبات الكلي (أول 5 فقط)
+    // تحقق من عدد السحوبات الكلي (أول 5 فقط)
     const totalClaims = await PromoClaim.countDocuments();
     if (totalClaims >= 5) {
       return res.status(400).json({ error: 'Promo limit reached. No slots left.' });
     }
 
-    // 4. حجز السلوت فوراً لمنع التسابق (race condition) بين عدة طلبات متزامنة
+    // حجز السلوت فوراً لمنع التسابق (race condition) بين عدة طلبات متزامنة
     let reservation;
     try {
       reservation = await PromoClaim.create({
@@ -272,7 +439,7 @@ app.post('/api/claim-promo', async (req, res) => {
       return res.status(400).json({ error: 'Promo limit reached. No slots left.' });
     }
 
-    // 5. تنفيذ دفعة A2U فعلية
+    // تنفيذ دفعة A2U فعلية
     let paymentId = null;
     try {
       paymentId = await piSDK.createPayment({
@@ -308,7 +475,7 @@ app.post('/api/claim-promo', async (req, res) => {
 
   } catch (e) {
     console.error('Claim promo error:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -317,5 +484,3 @@ app.get('/', (req, res) => res.send('<h1>CexPi Backend - Running</h1>'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
