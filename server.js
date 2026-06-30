@@ -5,6 +5,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const axios = require('axios');
+const cloudinary = require('cloudinary').v2; // === CLOUDINARY ===
 
 const app = express();
 app.use(helmet());
@@ -44,6 +45,15 @@ app.use(express.json({ limit: '10mb' }));
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ Connected to MongoDB successfully'))
   .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// === CLOUDINARY CONFIG ===
+// يُستخدم Cloudinary فقط لتخزين الصور (تخزين خارجي)، بينما تبقى MongoDB
+// هي المصدر الوحيد لتخزين وعرض بيانات الإعلانات (نص + روابط الصور القصيرة)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 // ================= SECURITY HELPERS =================
 
@@ -86,14 +96,16 @@ function isValidObjectId(id) {
   return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
 }
 
-// يتحقق أن الصورة هي data URL صالحة لنوع صورة مسموح، وبحجم معقول (لتفادي XSS وتضخم القاعدة)
-const MAX_IMAGE_BASE64_LENGTH = 1400000; // ~1MB لكل صورة تقريباً
-const IMAGE_DATA_URL_REGEX = /^data:image\/(jpeg|jpg|png|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+// === CLOUDINARY: تحقق من روابط الصور بدل base64 ===
+// بعد التحويل إلى Cloudinary، لا نخزّن الصور كـ base64 ضخم في MongoDB،
+// بل فقط رابط Cloudinary القصير والآمن (secure_url)
+const MAX_IMAGE_URL_LENGTH = 500;
+const CLOUDINARY_URL_REGEX = /^https:\/\/res\.cloudinary\.com\/[A-Za-z0-9_-]+\/image\/upload\/.+$/;
 
-function isValidImageDataUrl(str) {
+function isValidCloudinaryUrl(str) {
   if (typeof str !== 'string') return false;
-  if (str.length === 0 || str.length > MAX_IMAGE_BASE64_LENGTH) return false;
-  return IMAGE_DATA_URL_REGEX.test(str);
+  if (str.length === 0 || str.length > MAX_IMAGE_URL_LENGTH) return false;
+  return CLOUDINARY_URL_REGEX.test(str);
 }
 
 const ALLOWED_CATEGORIES = ['car', 'truck', 'motorcycle'];
@@ -113,6 +125,7 @@ const UserSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 
 // نموذج الإعلان
+// === CLOUDINARY: images الآن مصفوفة روابط قصيرة بدل base64 ===
 const ListingSchema = new mongoose.Schema({
   sellerUid: { type: String, required: true },
   title: { type: String, required: true, trim: true, maxlength: 150 },
@@ -125,7 +138,7 @@ const ListingSchema = new mongoose.Schema({
   mileage: { type: Number, min: 0, max: 10000000, default: null },
   country: { type: String, required: true, trim: true, maxlength: 100 },
   region: { type: String, required: true, trim: true, maxlength: 150 },
-  images: [{ type: String, maxlength: MAX_IMAGE_BASE64_LENGTH }],
+  images: [{ type: String, maxlength: MAX_IMAGE_URL_LENGTH }],
   phoneNumber: { type: String, required: true, trim: true, maxlength: 30 },
   createdAt: { type: Date, default: Date.now },
   active: { type: Boolean, default: true }
@@ -162,6 +175,35 @@ app.post('/api/register-user', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// === CLOUDINARY: توقيع رفع آمن (Signed Upload) ===
+// يولّد توقيعاً صالحاً لمدة محدودة يستخدمه الفرونت إند للرفع المباشر إلى Cloudinary
+// من متصفح المستخدم، بدون كشف API secret، وبدون تمرير الصور عبر سيرفرنا أو MongoDB.
+// محمي بمصادقة Pi + rate limit لمنع استغلال حساب Cloudinary من أي شخص خارج التطبيق.
+app.post('/api/cloudinary-signature', strictLimiter, requirePiAuth, async (req, res) => {
+  try {
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+      return res.status(500).json({ error: 'Cloudinary is not configured on the server' });
+    }
+
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder = 'cexpi_listings';
+    const paramsToSign = { timestamp, folder };
+    const signature = cloudinary.utils.api_sign_request(paramsToSign, process.env.CLOUDINARY_API_SECRET);
+
+    res.json({
+      success: true,
+      timestamp,
+      signature,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      folder
+    });
+  } catch (e) {
+    console.error('Cloudinary signature error:', e);
+    res.status(500).json({ error: 'Failed to generate upload signature' });
   }
 });
 
@@ -238,6 +280,7 @@ app.post('/api/complete-payment', strictLimiter, async (req, res) => {
 });
 
 // نشر الإعلان — يتطلب مصادقة صالحة + رصيد إعلان مدفوع فعلياً (لمنع النشر المجاني)
+// === CLOUDINARY: images الآن مصفوفة روابط Cloudinary قصيرة (تم رفعها من الفرونت مباشرة) ===
 app.post('/api/complete-listing', strictLimiter, requirePiAuth, async (req, res) => {
   const {
     title, description, priceInPi, category, make, model,
@@ -275,8 +318,8 @@ app.post('/api/complete-listing', strictLimiter, requirePiAuth, async (req, res)
       return res.status(400).json({ error: 'Maximum 6 images allowed' });
     }
     for (const img of images) {
-      if (!isValidImageDataUrl(img)) {
-        return res.status(400).json({ error: 'One or more images are invalid or too large (max ~1MB each)' });
+      if (!isValidCloudinaryUrl(img)) {
+        return res.status(400).json({ error: 'One or more image URLs are invalid' });
       }
     }
     safeImages = images;
