@@ -178,32 +178,56 @@ app.post('/api/register-user', async (req, res) => {
   }
 });
 
-// === CLOUDINARY: توقيع رفع آمن (Signed Upload) ===
-// يولّد توقيعاً صالحاً لمدة محدودة يستخدمه الفرونت إند للرفع المباشر إلى Cloudinary
-// من متصفح المستخدم، بدون كشف API secret، وبدون تمرير الصور عبر سيرفرنا أو MongoDB.
-// محمي بمصادقة Pi + rate limit لمنع استغلال حساب Cloudinary من أي شخص خارج التطبيق.
-app.post('/api/cloudinary-signature', strictLimiter, requirePiAuth, async (req, res) => {
+// === CLOUDINARY: رفع الصورة عبر سيرفرنا (Server-side proxy upload) ===
+// لا نجعل متصفح المستخدم (خصوصاً Pi Browser المقيّد أمنياً) يتصل مباشرة بـ
+// api.cloudinary.com، لأن هذا غالباً ما يُحجب أو يفشل بصمت بخطأ "Failed to fetch"
+// داخل بعض الـ WebViews. بدلاً من ذلك: المتصفح يرفع الصورة إلى دومين سيرفرنا
+// (الموثوق به مسبقاً لأنه يُستخدم في الدفع)، والسيرفر هو من يرفعها إلى Cloudinary.
+// API secret لا يخرج أبداً من السيرفر، وهذا أكثر أماناً من الرفع المباشر من المتصفح.
+const multer = require('multer');
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1 * 1024 * 1024 } // 1MB، يطابق حد الصور في باقي التطبيق
+});
+
+function handleImageUpload(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message === 'File too large' ? 'Image too large (max 1MB)' : 'Image upload failed' });
+    }
+    next();
+  });
+}
+
+app.post('/api/upload-image', strictLimiter, requirePiAuth, handleImageUpload, async (req, res) => {
   try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file provided' });
+    }
     if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
       return res.status(500).json({ error: 'Cloudinary is not configured on the server' });
     }
 
-    const timestamp = Math.round(Date.now() / 1000);
-    const folder = 'cexpi_listings';
-    const paramsToSign = { timestamp, folder };
-    const signature = cloudinary.utils.api_sign_request(paramsToSign, process.env.CLOUDINARY_API_SECRET);
+    const allowedMime = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    if (!allowedMime.includes(req.file.mimetype)) {
+      return res.status(400).json({ error: 'Invalid image type' });
+    }
 
-    res.json({
-      success: true,
-      timestamp,
-      signature,
-      apiKey: process.env.CLOUDINARY_API_KEY,
-      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
-      folder
+    const uploadResult = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: 'cexpi_listings', resource_type: 'image' },
+        (error, result) => {
+          if (error) return reject(error);
+          resolve(result);
+        }
+      );
+      stream.end(req.file.buffer);
     });
+
+    res.json({ success: true, url: uploadResult.secure_url });
   } catch (e) {
-    console.error('Cloudinary signature error:', e);
-    res.status(500).json({ error: 'Failed to generate upload signature' });
+    console.error('Image upload error:', e);
+    res.status(500).json({ error: 'Failed to upload image' });
   }
 });
 
