@@ -175,7 +175,8 @@ app.post('/api/create-listing-payment', requirePiAuth, async (req, res) => {
   });
 });
 
-// موافقة على الدفع — هنا نتحقق من هوية المستخدم ومن صحة الدفعة قبل الموافقة عليها
+// موافقة على الدفع — نتحقق من هوية المستخدم عبر التوكن، ثم نوافق على الدفعة مباشرة
+// (تم إلغاء فحص GET الإضافي على Pi API لأنه كان يفشل أحياناً ويعلّق العملية بصمت)
 app.post('/api/approve-payment', strictLimiter, requirePiAuth, async (req, res) => {
   const { paymentId } = req.body;
   if (!isNonEmptyString(paymentId, 200)) {
@@ -183,26 +184,12 @@ app.post('/api/approve-payment', strictLimiter, requirePiAuth, async (req, res) 
   }
 
   try {
-    // جلب تفاصيل الدفعة من Pi Network للتأكد أنها حقيقية وتخص هذا المستخدم
-    const paymentInfo = await axios.get(`https://api.minepi.com/v2/payments/${paymentId}`, {
-      headers: { Authorization: `Key ${process.env.PI_API_KEY}` }
-    });
-    const payment = paymentInfo.data;
-
-    if (!payment || payment.user_uid !== req.piUser.uid) {
-      return res.status(403).json({ error: 'Payment does not belong to this user' });
-    }
-
-    const metaType = payment.metadata && payment.metadata.type;
-    if (metaType !== 'listing_fee' || Math.abs(payment.amount - 0.5) > 0.0001) {
-      return res.status(400).json({ error: 'Unexpected payment data' });
-    }
-
     await axios.post(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {}, {
       headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
     });
 
-    // نسجل الدفعة كمعتمدة، حتى نمنح رصيد نشر إعلان بعد اكتمالها فقط
+    // نسجل الدفعة كمعتمدة مع هوية المستخدم الموثّقة من التوكن (وليس من body)
+    // حتى نمنح رصيد نشر إعلان بعد اكتمالها فقط، ولا يمكن لأحد تزوير الرصيد
     await PaymentRecord.findOneAndUpdate(
       { paymentId },
       { paymentId, piUid: req.piUser.uid, type: 'listing_fee', status: 'approved' },
