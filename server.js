@@ -108,7 +108,53 @@ function isValidCloudinaryUrl(str) {
   return CLOUDINARY_URL_REGEX.test(str);
 }
 
+// === CLOUDINARY CLEANUP HELPERS ===
+// يستخرج public_id من رابط Cloudinary كامل حتى نتمكن من حذف الصورة فعلياً من Cloudinary
+// مثال: https://res.cloudinary.com/xxx/image/upload/v1234567890/cexpi_listings/abc123.jpg
+// الناتج: cexpi_listings/abc123
+function extractCloudinaryPublicId(url) {
+  try {
+    if (!isValidCloudinaryUrl(url)) return null;
+    // كل ما بعد /upload/ وبعد تجاوز إصدار اختياري مثل v1234567890/
+    const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[a-zA-Z0-9]+(?:\?.*)?$/);
+    if (!match || !match[1]) return null;
+    return match[1];
+  } catch (e) {
+    return null;
+  }
+}
+
+// يحذف مجموعة صور من Cloudinary دفعة واحدة بالاعتماد على روابطها المخزنة في MongoDB
+// لا يوقف تنفيذ الطلب الأساسي (حذف الإعلان) في حال فشل حذف الصور، فقط يسجل الخطأ في اللوغ،
+// حتى لا يبقى الإعلان "عالقاً" في قاعدة البيانات بسبب مشكلة مؤقتة في Cloudinary
+async function deleteCloudinaryImages(images) {
+  if (!Array.isArray(images) || images.length === 0) return;
+
+  const publicIds = images
+    .map(extractCloudinaryPublicId)
+    .filter(id => !!id);
+
+  if (publicIds.length === 0) return;
+
+  try {
+    await cloudinary.api.delete_resources(publicIds, { resource_type: 'image' });
+  } catch (e) {
+    console.error('Cloudinary delete_resources error:', e.message || e);
+    // محاولة احتياطية: حذف كل صورة على حدة في حال فشل الحذف الجماعي
+    for (const publicId of publicIds) {
+      try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+      } catch (singleErr) {
+        console.error(`Cloudinary destroy error for ${publicId}:`, singleErr.message || singleErr);
+      }
+    }
+  }
+}
+
 const ALLOWED_CATEGORIES = ['car', 'truck', 'motorcycle'];
+
+// مدة بقاء الإعلان قبل حذفه تلقائياً: 3 أشهر (90 يوماً)
+const LISTING_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
 
 // ================= SCHEMAS =================
 
@@ -403,6 +449,7 @@ app.get('/api/get-listings', async (req, res) => {
 });
 
 // حذف الإعلان — يتطلب مصادقة صالحة، ويستخدم هوية المستخدم الحقيقية من التوكن فقط
+// === تحديث: يحذف الآن صور الإعلان من Cloudinary أيضاً قبل حذف الإعلان من MongoDB ===
 app.post('/api/delete-listing', requirePiAuth, async (req, res) => {
   const { listingId } = req.body;
   if (!isValidObjectId(listingId)) {
@@ -412,6 +459,9 @@ app.post('/api/delete-listing', requirePiAuth, async (req, res) => {
   try {
     const listing = await Listing.findOne({ _id: listingId, sellerUid: req.piUser.uid });
     if (!listing) return res.status(404).json({ error: 'Listing not found or not owned by you' });
+
+    // حذف صور الإعلان من Cloudinary أولاً (لا يوقف الحذف من MongoDB في حال فشل)
+    await deleteCloudinaryImages(listing.images);
 
     await Listing.deleteOne({ _id: listingId });
     res.json({ success: true });
@@ -531,6 +581,57 @@ app.post('/api/claim-promo', strictLimiter, requirePiAuth, async (req, res) => {
     console.error('Claim promo error:', e.response?.data || e.message);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ================= AUTO-EXPIRE LISTINGS AFTER 3 MONTHS =================
+// يبحث دورياً عن الإعلانات التي مر عليها أكثر من 90 يوماً، يحذف صورها من Cloudinary
+// أولاً، ثم يحذفها نهائياً من MongoDB. يُنفَّذ في دفعات (batch) لتفادي إرهاق قاعدة
+// البيانات أو Cloudinary في حال وجود عدد كبير من الإعلانات المنتهية دفعة واحدة.
+let isExpiryJobRunning = false;
+
+async function expireOldListings() {
+  if (isExpiryJobRunning) return; // يمنع تشغيل أكثر من نسخة من المهمة في نفس الوقت
+  isExpiryJobRunning = true;
+
+  try {
+    const cutoffDate = new Date(Date.now() - LISTING_EXPIRY_MS);
+    const BATCH_SIZE = 50;
+
+    // معالجة الإعلانات المنتهية على دفعات حتى لا نحمّل الذاكرة بعدد كبير دفعة واحدة
+    // في كل حلقة نجلب حتى BATCH_SIZE إعلان منتهي، ونستمر حتى لا يتبقى شيء
+    while (true) {
+      const expiredListings = await Listing.find({ createdAt: { $lt: cutoffDate } })
+        .limit(BATCH_SIZE)
+        .select('_id images');
+
+      if (expiredListings.length === 0) break;
+
+      for (const listing of expiredListings) {
+        try {
+          await deleteCloudinaryImages(listing.images);
+          await Listing.deleteOne({ _id: listing._id });
+        } catch (itemErr) {
+          console.error(`Failed to expire listing ${listing._id}:`, itemErr.message || itemErr);
+        }
+      }
+
+      console.log(`🗑️ Auto-expired ${expiredListings.length} listing(s) older than 3 months`);
+
+      // إن كانت الدفعة أصغر من الحد الأقصى فهذا يعني أنها آخر دفعة
+      if (expiredListings.length < BATCH_SIZE) break;
+    }
+  } catch (e) {
+    console.error('Auto-expire listings job error:', e.message || e);
+  } finally {
+    isExpiryJobRunning = false;
+  }
+}
+
+// نُشغّل المهمة فور بدء تشغيل السيرفر، ثم نكررها كل ساعة
+const LISTING_EXPIRY_CHECK_INTERVAL_MS = 60 * 60 * 1000; // كل ساعة
+mongoose.connection.once('open', () => {
+  expireOldListings();
+  setInterval(expireOldListings, LISTING_EXPIRY_CHECK_INTERVAL_MS);
 });
 
 
